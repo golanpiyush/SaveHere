@@ -745,6 +745,22 @@ def signal_handler(signum, frame):
 signal.signal(signal.SIGTERM, signal_handler)
 signal.signal(signal.SIGINT, signal_handler)
 
+
+
+@app.route('/health', methods=['GET'])
+def health_check():
+    """Enhanced health check endpoint with SaveHere proxy status"""
+    savehere_status = check_savehere_proxy_health()
+    
+    return jsonify({
+        "status": "healthy",
+        "active_sessions": len(event_queues),
+        "ytmusic_available": yt_music is not None,
+        "savehere_proxy_enabled": USE_SAVEHERE_PROXY,
+        "savehere_proxy_healthy": savehere_status,
+        "proxy_url": SAVEHERE_PROXY_URL if USE_SAVEHERE_PROXY else None
+    }), 200
+
 if __name__ == "__main__":
     logger.info("Starting optimized music server")
     app.run(debug=False, threaded=True, host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
