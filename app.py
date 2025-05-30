@@ -43,6 +43,12 @@ CONFIG = {
     'max_concurrent_sessions': 10,  # Limit concurrent SSE sessions
 }
 
+CONFIG.update({
+    'proxy_timeout': 5,
+    'proxy_health_check_interval': 300,  # 5 minutes
+    'session_expiration': 600,  # 10 minutes
+})
+
 # Configure logging with better format
 logging.basicConfig(
     level=logging.INFO,
@@ -65,6 +71,10 @@ except Exception as e:
     logger.error(f"Failed to initialize YTMusic: {e}")
     yt_music = None
 
+# Add after global instances
+SAVEHERE_PROXY_AVAILABLE = False
+LAST_PROXY_CHECK = 0
+
 # Thread pool with proper cleanup
 executor = ThreadPoolExecutor(max_workers=CONFIG['max_workers'])
 atexit.register(lambda: executor.shutdown(wait=False, cancel_futures=True))
@@ -72,75 +82,71 @@ atexit.register(lambda: executor.shutdown(wait=False, cancel_futures=True))
 
 # SaveHere Proxy Integration Functions
 def get_proxied_url(original_url: str) -> str:
-    """Use SaveHere's proxy to bypass YouTube restrictions"""
-    if not USE_SAVEHERE_PROXY or not original_url:
+    """Enhanced proxy handling with fallback"""
+    if not original_url:
+        return original_url
+    
+    # Skip if proxy not enabled or unavailable
+    if not USE_SAVEHERE_PROXY or not check_savehere_proxy_health():
         return original_url
     
     try:
-        logger.info(f"Attempting to proxy URL through SaveHere: {original_url[:50]}...")
-        
+        logger.info(f"Proxying URL: {original_url[:50]}...")
         proxy_response = requests.post(
             f"{SAVEHERE_PROXY_URL}/api/proxy",
-            json={
-                "url": original_url,
-                "type": "audio",
-                "bypass_restrictions": True
-            },
-            timeout=CONFIG['proxy_timeout'],
-            headers={
-                'Content-Type': 'application/json',
-                'User-Agent': 'SaveHere-MusicServer/1.0'
-            }
+            json={"url": original_url, "type": "audio"},
+            timeout=CONFIG['proxy_timeout']
         )
         
         if proxy_response.status_code == 200:
-            proxy_data = proxy_response.json()
-            proxied_url = proxy_data.get('proxied_url') or proxy_data.get('url')
-            if proxied_url:
-                logger.info("Successfully proxied URL through SaveHere")
-                return proxied_url
-        
-        logger.warning(f"SaveHere proxy returned status {proxy_response.status_code}")
-        
-    except requests.exceptions.Timeout:
-        logger.warning("SaveHere proxy request timed out")
-    except requests.exceptions.ConnectionError:
-        logger.warning("Could not connect to SaveHere proxy service")
-    except Exception as e:
-        logger.warning(f"SaveHere proxy error: {e}")
+            return proxy_response.json().get('proxied_url', original_url)
     
-    # Return original URL if proxy fails
+    except requests.exceptions.Timeout:
+        logger.warning("Proxy request timed out")
+    except Exception as e:
+        logger.warning(f"Proxy error: {str(e)[:50]}")
+    
     return original_url
 
-def check_savehere_proxy_health() -> bool:
-    """Check if SaveHere proxy service is available"""
-    if not USE_SAVEHERE_PROXY:
-        return False
+# session expiration tracker
+session_last_activity: Dict[str, float] = {}
+
+def cleanup_old_sessions():
+    """Clean up inactive sessions"""
+    now = time.time()
+    expired = []
     
+    with queue_lock:
+        for session_id, last_active in list(session_last_activity.items()):
+            if now - last_active > CONFIG['session_expiration']:
+                expired.append(session_id)
+        
+        for session_id in expired:
+            logger.info(f"Cleaning up expired session: {session_id}")
+            cleanup_session(session_id)
+            del session_last_activity[session_id]
+
+def check_savehere_proxy_health() -> bool:
+    """Check if SaveHere proxy service is available with timeout"""
+    global LAST_PROXY_CHECK, SAVEHERE_PROXY_AVAILABLE
+    
+    # Only check every 5 minutes
+    if time.time() - LAST_PROXY_CHECK < CONFIG['proxy_health_check_interval']:
+        return SAVEHERE_PROXY_AVAILABLE
+        
     try:
         response = requests.get(
             f"{SAVEHERE_PROXY_URL}/health",
-            timeout=5
+            timeout=3
         )
-        return response.status_code == 200
-    except:
-        return False
-
-# Global instances with error handling
-try:
-    yt_music = YTMusic()
-    logger.info("YTMusic client initialized successfully")
+        SAVEHERE_PROXY_AVAILABLE = response.status_code == 200
+    except Exception:
+        SAVEHERE_PROXY_AVAILABLE = False
     
-    # Check SaveHere proxy availability
-    if check_savehere_proxy_health():
-        logger.info("SaveHere proxy service is available")
-    else:
-        logger.warning("SaveHere proxy service not available, using direct connections")
-        USE_SAVEHERE_PROXY = False
-        
-except Exception as e:
-    logger.error(f"Failed to initialize YTMusic: {e}")
-    yt_music = None
+    LAST_PROXY_CHECK = time.time()
+    status = "available" if SAVEHERE_PROXY_AVAILABLE else "unavailable"
+    logger.info(f"SaveHere proxy status: {status}")
+    return SAVEHERE_PROXY_AVAILABLE
 
 # Rate limiting with thread safety
 class RateLimiter:
@@ -184,8 +190,10 @@ def cleanup_session(session_id: str):
             del session_threads[session_id]
 
 def create_queue_for_session(session_id: str) -> queue.Queue:
-    """Create a new queue for a session with limits"""
+    """Create session queue with expiration tracking"""
     with queue_lock:
+        cleanup_old_sessions()  # Clean up before creating new
+        session_last_activity[session_id] = time.time()
         if len(event_queues) >= CONFIG['max_concurrent_sessions']:
             old_sessions = list(event_queues.keys())[:len(event_queues) - CONFIG['max_concurrent_sessions'] + 1]
             for old_session in old_sessions:
